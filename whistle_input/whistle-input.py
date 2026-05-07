@@ -17,6 +17,11 @@ class Pitch:
 
 
 class PitchDetector:
+    # Detect the pitch of incoming audio using a simple FFT-based method. 
+    # It applies a Hanning window to the audio data, computes the FFT, and looks
+    # for the peak in the spectrum within a specified frequency range. 
+    # It also applies a smoothing filter to the detected frequency to reduce jitter,
+    # and uses an RMS threshold to ignore low-volume noise. The latest detected pitch is stored in a thread-safe manner for retrieval by the main game loop.
     def __init__(
         self,
         samplerate: int = 44100,
@@ -38,6 +43,10 @@ class PitchDetector:
         self._lock = threading.Lock()
         self._stream: Optional[sd.InputStream] = None
 
+    # Start the audio input stream and begin processing audio data. 
+    # The callback function will be called for each block of audio data, where it will estimate the pitch 
+    # and update the latest detected pitch in a thread-safe manner. 
+    # The stream is configured for low latency to ensure responsive pitch detection for the game.
     def start(self) -> None:
         self._stream = sd.InputStream(
             device=self.device,
@@ -49,16 +58,28 @@ class PitchDetector:
         )
         self._stream.start()
 
+    # Stop the audio input stream and clean up resources. 
+    # This should be called when the program is exiting to ensure that the audio stream is properly closed.
     def stop(self) -> None:
         if self._stream is not None:
             self._stream.stop()
             self._stream.close()
             self._stream = None
 
+    # Retrieve the latest detected pitch in a thread-safe manner. 
+    # This method can be called by the main game loop to get the current pitch frequency, 
+    # which will be used to update the microphone lane and detect chirps. 
+    # It returns a Pitch object containing the frequency, or None if no valid pitch is currently detected.
     def latest(self) -> Pitch:
         with self._lock:
             return Pitch(self._latest.freq)
 
+    # The audio callback function that processes incoming audio data. 
+    # It estimates the pitch of the audio block and updates the latest detected pitch. 
+    # The pitch estimation is done by applying a Hanning window to the audio data, computing the FFT, 
+    # and finding the peak in the spectrum within the specified frequency range. 
+    # The detected frequency is smoothed over time to reduce jitter, and low-volume noise is ignored 
+    # based on the RMS threshold. The latest pitch is stored in a thread-safe manner for retrieval by the main game loop
     def _callback(self, indata, frames, callback_time, status) -> None:
         freq = self._estimate_pitch(indata[:, 0].astype(np.float64))
 
@@ -66,7 +87,7 @@ class PitchDetector:
             if self._smooth_freq is None:
                 self._smooth_freq = freq
             else:
-                self._smooth_freq = 0.65 * self._smooth_freq + 0.35 * freq
+                self._smooth_freq = 0.65 * self._smooth_freq + 0.35 * freq # simple low-pass filter for smoothing
             freq = self._smooth_freq
         else:
             self._smooth_freq = None
@@ -74,12 +95,18 @@ class PitchDetector:
         with self._lock:
             self._latest = Pitch(freq)
 
+    # Estimate the pitch of a block of audio data using an FFT-based method. 
+    # It applies a Hanning window to the audio data, computes the FFT, and looks
+    # for the peak in the spectrum within the specified frequency range. 
+    # It also applies an RMS threshold to ignore low-volume noise, and checks the strength of the detected peak against the noise floor to avoid false detections. 
+    # If a valid pitch is detected, it returns the frequency in Hz; otherwise, it returns None.
     def _estimate_pitch(self, data: np.ndarray) -> Optional[float]:
         data = data - np.mean(data)
         rms = float(np.sqrt(np.mean(data * data)))
         if rms < self.rms_threshold:
             return None
 
+        # FFT-based pitch estimation adapted with help from AI explanations and online DSP references.
         windowed = data * np.hanning(len(data))
         spectrum = np.abs(np.fft.rfft(windowed))
         freqs = np.fft.rfftfreq(len(data), 1.0 / self.samplerate)
@@ -94,7 +121,7 @@ class PitchDetector:
         noise_floor = float(np.mean(sub) + 1e-9)
 
         # Ignore weak peaks caused by background noise.
-        if peak_value / noise_floor < 4.0:
+        if peak_value / noise_floor < 4.0: # Noise thresholds were adjusted experimentally during testing.
             return None
 
         global_index = np.where(mask)[0][0] + peak_index
@@ -106,14 +133,18 @@ class PitchDetector:
         return None
 
 
+# Detect chirps based on the history of detected pitches. 
+# It looks for a consistent increase or decrease in pitch over a short time window,
+# and applies thresholds on the minimum frequency change and slope to determine if a valid chirp has occurred. 
+# It also implements a cooldown period after detecting a chirp to prevent multiple triggers from the same gesture.
 class ChirpDetector:
     def __init__(
         self,
-        window_seconds: float = 0.75,
-        min_points: int = 5,
-        min_freq_change: float = 120.0,
-        min_slope: float = 120.0,
-        cooldown_seconds: float = 0.55,
+        window_seconds: float = 0.75, # time window to analyze for chirp patterns
+        min_points: int = 5, # minimum number of pitch detections required in the window to consider it a valid chirp
+        min_freq_change: float = 120.0, # minimum frequency change in Hz to consider it a valid chirp
+        min_slope: float = 120.0, # minimum slope of the frequency change in Hz/second to consider it a valid chirp
+        cooldown_seconds: float = 0.55, # minimum time between consecutive chirp detections to prevent multiple triggers from the same gesture
     ) -> None:
         self.window_seconds = window_seconds
         self.min_points = min_points
@@ -124,6 +155,9 @@ class ChirpDetector:
         self.history = deque()
         self.last_trigger = 0.0
 
+    # Update the chirp detector with the latest detected pitch frequency. 
+    # It maintains a history of recent pitch detections and checks for patterns that indicate an upward or downward chirp.
+    # If a valid chirp is detected, it returns the direction ("up" or "down").
     def update(self, freq: Optional[float]) -> Optional[str]:
         now = time.time()
 
@@ -143,6 +177,9 @@ class ChirpDetector:
 
         return direction
 
+    # Analyze the history of detected pitches to determine if a valid chirp has occurred. 
+    # It checks if there are enough data points, if the frequency change exceeds the minimum threshold, 
+    # and if the slope of the frequency change is consistent with an upward or downward chirp.
     def detect(self) -> Optional[str]:
         if len(self.history) < self.min_points:
             return None
@@ -154,6 +191,8 @@ class ChirpDetector:
         if times[-1] <= 0:
             return None
 
+        # Chirp direction is estimated from pitch slope over time.
+        # The implementation was refined experimentally during testing.
         freq_change = float(freqs[-1] - freqs[0])
         slope = float(np.polyfit(times, freqs, 1)[0])
 
@@ -164,7 +203,10 @@ class ChirpDetector:
 
         return "up" if slope > 0 else "down"
 
-
+# Handle keyboard output for simulating arrow key presses based on detected chirps. 
+# If enabled, it uses the pynput library to send keyboard events to the system. 
+# The press_arrow method can be called with the direction of the detected chirp to simulate 
+# an arrow key press, which can be used to control the game based on the player's whistle gestures.
 class KeyboardOutput:
     def __init__(self, enabled: bool) -> None:
         self.enabled = enabled
@@ -173,7 +215,7 @@ class KeyboardOutput:
         if enabled:
             from pynput.keyboard import Controller
             self.keyboard = Controller()
-
+    
     def press_arrow(self, direction: str) -> None:
         if not self.enabled or self.keyboard is None:
             return
@@ -185,6 +227,8 @@ class KeyboardOutput:
         self.keyboard.release(key)
 
 
+# The main window of the whistle input application. 
+# It displays a simple interface with instructions and visual feedback for the detected pitch and chirps.
 class WhistleWindow(pyglet.window.Window):
     def __init__(
         self,
@@ -192,8 +236,8 @@ class WhistleWindow(pyglet.window.Window):
         chirp_detector: ChirpDetector,
         keyboard_output: KeyboardOutput,
     ) -> None:
-        super().__init__(620, 560, caption="Whistle Input", resizable=False)
-        pyglet.gl.glClearColor(0.08, 0.09, 0.12, 1.0)
+        super().__init__(620, 560, caption="Whistle Input", resizable=False) 
+        pyglet.gl.glClearColor(0.08, 0.09, 0.12, 1.0) 
 
         self.pitch_detector = pitch_detector
         self.chirp_detector = chirp_detector
@@ -265,21 +309,26 @@ class WhistleWindow(pyglet.window.Window):
 
         self.help.draw()
 
-
+# List available audio input devices to the console. 
+# This can be used by the user to identify which device index corresponds to their microphone for use with the pitch detector.
 def list_input_devices() -> None:
     print("Available input devices:\n")
     for i, dev in enumerate(sd.query_devices()):
         if dev["max_input_channels"] > 0:
             print(f"{i}: {dev['name']}")
 
-
+# The main entry point of the program. Parses command line arguments for audio device, 
+# sampling rate, block size, and other settings.
+# Initializes the pitch detector and chirp detector, and starts the Pyglet application loop with the WhistleWindow. 
+# It also handles listing audio devices if requested, 
+# and ensures that the audio stream is properly stopped when the program exits.   
 def main() -> None:
     parser = argparse.ArgumentParser(description="Whistle chirp input.")
     parser.add_argument("--device", type=int, default=None)
     parser.add_argument("--list-devices", action="store_true")
     parser.add_argument("--keyboard", action="store_true")
-    parser.add_argument("--samplerate", type=int, default=44100)
-    parser.add_argument("--blocksize", type=int, default=1024)
+    parser.add_argument("--samplerate", type=int, default=44100) # reduce sampling rate for lower latency
+    parser.add_argument("--blocksize", type=int, default=1024) # reduce blocksize for lower latency
     args = parser.parse_args()
 
     if args.list_devices:

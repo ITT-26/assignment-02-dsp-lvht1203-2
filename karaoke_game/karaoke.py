@@ -18,11 +18,13 @@ import sounddevice as sd
 A4_MIDI = 69
 A4_FREQ = 440.0
 
-
+# MIDI note to frequency conversion
 def midi_note_to_freq(note: int) -> float:
     return A4_FREQ * (2 ** ((note - A4_MIDI) / 12))
 
-
+# Normalize frequency to be within 1.5x of target for visual comparison. 
+# This avoids yellow bars appearing one octave away.
+# Octave normalization added after debugging octave mismatches during testing.
 def normalize_freq_to_target(freq: float, target_freq: float) -> float:
     if freq <= 0 or target_freq <= 0:
         return freq
@@ -33,19 +35,20 @@ def normalize_freq_to_target(freq: float, target_freq: float) -> float:
         corrected *= 2.0
     return corrected
 
-
+# Cents error between detected frequency and target frequency. 100 cents = 1 semitone. 
+# Returns a large number if either frequency is non-positive.
 def cents_error(freq: float, target_freq: float) -> float:
     if freq <= 0 or target_freq <= 0:
         return 9999.0
     corrected = normalize_freq_to_target(freq, target_freq)
     return 1200.0 * math.log2(corrected / target_freq)
 
-
+# Note name for MIDI note number, e.g. 60 -> C4, 61 -> C#4, etc.
 def note_name(note: int) -> str:
     names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
     return f"{names[note % 12]}{note // 12 - 1}"
 
-
+# Represents a MIDI note event with start time, end time, MIDI note number, and frequency.
 @dataclass
 class NoteEvent:
     start: float
@@ -57,7 +60,7 @@ class NoteEvent:
     def duration(self) -> float:
         return max(0.0, self.end - self.start)
 
-
+# Load MIDI file and extract note events. If a note is held, extend its end time to the next note or by a default length.
 def load_midi_notes(filename: str, default_note_length: float = 0.35) -> list[NoteEvent]:
     path = Path(filename)
     if not path.exists():
@@ -65,11 +68,12 @@ def load_midi_notes(filename: str, default_note_length: float = 0.35) -> list[No
 
     midi = mido.MidiFile(str(path))
     ticks_per_beat = midi.ticks_per_beat
-    tempo = 500000
-    current_seconds = 0.0
+    tempo = 500000  # default tempo (microseconds per beat)
+    current_seconds = 0.0  
     active: dict[int, list[float]] = {}
     notes: list[NoteEvent] = []
 
+    # Process MIDI messages in order, keeping track of active notes and their start times. 
     for msg in mido.merge_tracks(midi.tracks):
         current_seconds += mido.tick2second(msg.time, ticks_per_beat, tempo)
         if msg.type == "set_tempo":
@@ -104,14 +108,15 @@ def load_midi_notes(filename: str, default_note_length: float = 0.35) -> list[No
 
     return extended
 
-
+# The main game window. Displays target notes and microphone pitch history, and calculates score based on how well the user matches the target.
 @dataclass
 class PitchState:
     freq: Optional[float] = None
     rms: float = 0.0
     confidence: float = 0.0
 
-
+# Pitch detection implementation was developed with help from AI-assisted
+# explanations and DSP references, then tuned experimentally during testing.
 class PitchDetector:
     def __init__(
         self,
@@ -162,7 +167,7 @@ class PitchDetector:
             if self._smooth_freq is None:
                 self._smooth_freq = freq
             else:
-                self._smooth_freq = 0.70 * self._smooth_freq + 0.30 * freq
+                self._smooth_freq = 0.70 * self._smooth_freq + 0.30 * freq # Simple smoothing filter added experimentally to reduce pitch jitter.
             freq = self._smooth_freq
         else:
             self._smooth_freq = None
@@ -170,6 +175,8 @@ class PitchDetector:
         with self._lock:
             self._latest = PitchState(freq=freq, rms=rms, confidence=conf)
 
+    # Autocorrelation-based pitch estimation adapted from DSP references
+    # and refined experimentally for microphone robustness.
     def _estimate_pitch(self, data: np.ndarray) -> tuple[Optional[float], float, float]:
         data = data - np.mean(data)
         rms = float(np.sqrt(np.mean(data * data)))
@@ -192,7 +199,7 @@ class PitchDetector:
             return None, rms, 0.0
 
         confidence = float(corr[lag] / (corr[0] + 1e-9))
-        if confidence < 0.22:
+        if confidence < 0.22: # Threshold tuned experimentally to reject unstable detections and background noise.
             return None, rms, confidence
 
         freq = self.samplerate / lag
@@ -200,7 +207,7 @@ class PitchDetector:
             return None, rms, confidence
         return float(freq), rms, confidence
 
-
+# The main game window. Displays target notes and microphone pitch history, and calculates score based on how well the user matches the target.
 class KaraokeGame(pyglet.window.Window):
     def __init__(self, midi_file: str, detector: PitchDetector) -> None:
         super().__init__(920, 620, caption="ITT Karaoke Game", resizable=False)
@@ -208,22 +215,22 @@ class KaraokeGame(pyglet.window.Window):
         self.notes = load_midi_notes(midi_file)
         self.detector = detector
         self.midi_file = midi_file
-
+        # Game state
         self.started = False
         self.finished = False
         self.start_wall_time = 0.0
         self.pause_offset = 0.0
         self.score = 0.0
         self.combo = 0
-
+        # Pre-calculate total note time for final score calculation. This is the total time the player could have been singing correct notes.
         self.total_song_note_time = sum(n.duration for n in self.notes)
         self.pitch_history: deque[tuple[float, float]] = deque(maxlen=160)
         self._last_history_add = 0.0
-
+        # Determine the MIDI note range for visual display, with some padding. This is used to map MIDI notes to vertical positions in the lanes.
         all_midi_notes = [n.note for n in self.notes]
         self.low_note = min(all_midi_notes) - 4
         self.high_note = max(all_midi_notes) + 4
-
+        # Set up labels for title, target note, score, and instructions. Use a monospace font for better alignment of score and combo text.
         self.font = "Arial"
         self.title_label = pyglet.text.Label("", font_name=self.font, font_size=22, x=20, y=self.height - 34, color=(255,255,255,255))
         self.target_label = pyglet.text.Label("", font_name=self.font, font_size=13, x=20, y=self.height - 62, color=(230,230,230,255))
@@ -233,18 +240,18 @@ class KaraokeGame(pyglet.window.Window):
         self.mic_lane_label = pyglet.text.Label("YOUR VOICE", font_name=self.font, font_size=12, x=18, y=150, color=(255,210,80,255))
 
         pyglet.clock.schedule_interval(self.update, 1 / 30)
-
+    # Calculate the current song time, accounting for pauses. This is used to determine which target note is active and to map microphone pitch history to the correct position in the lanes.
     def song_time(self) -> float:
         if not self.started:
             return self.pause_offset
         return time.time() - self.start_wall_time + self.pause_offset
-
+    # Find the current target note based on the song time. This is used to determine which note the player should be singing at any given moment, and to calculate score based on how well the player's pitch matches this target.
     def current_note(self, t: float) -> Optional[NoteEvent]:
         for n in self.notes:
             if n.start <= t <= n.end:
                 return n
         return None
-
+    # Update game state based on the latest detected pitch and the current target note. This is where scoring happens: if the player's pitch is close enough to the target, they earn points and build combo; if they are off, they lose combo. Also updates the pitch history for visual display in the microphone lane.
     def update(self, dt: float) -> None:
         if not self.started or self.finished:
             return
@@ -266,10 +273,11 @@ class KaraokeGame(pyglet.window.Window):
                 midi_float += 12
             self.pitch_history.append((t, midi_float))
             self._last_history_add = t
-
+        # Scoring: If the player is singing the correct note (within 150 cents), they earn score and build combo. If they are close (within 300 cents), they earn some score but lose combo. If they are far off, they lose all combo. This encourages players to try to match the target pitch as closely as possible.
         if target is not None and pitch.freq is not None:
             err = abs(cents_error(pitch.freq, target.freq))
-            if err < 150:
+            # Scoring thresholds were adjusted experimentally during gameplay testing.
+            if err < 150: 
                 self.score += dt
                 self.combo += 1
             elif err < 300:
@@ -279,12 +287,15 @@ class KaraokeGame(pyglet.window.Window):
                 self.combo = 0
         elif target is not None:
             self.combo = 0
-
+        # Check if we've passed the end of the last note. If so, mark the game as finished. 
+        # This allows the player to see their final score and gives them a chance to restart or quit.
         if t > self.notes[-1].end + 2.0:
             self.finished = True
             self.started = False
             self.pause_offset = self.notes[-1].end
 
+    # Handle key presses for starting/pausing the game, restarting, and quitting. SPACE toggles between start and pause, R restarts the game, and ESC quits. 
+    # This allows the player to control the flow of the game and gives them options to retry or exit.    
     def on_key_press(self, symbol, modifiers):
         if symbol == pyglet.window.key.SPACE:
             if self.finished:
@@ -300,6 +311,8 @@ class KaraokeGame(pyglet.window.Window):
         elif symbol == pyglet.window.key.ESCAPE:
             self.close()
 
+    # Reset game state to start a new game. This is called when the player presses R or SPACE after finishing. 
+    # It clears the score, combo, pitch history, and resets timing variables so that the player can start fresh.
     def restart(self) -> None:
         self.started = False
         self.finished = False
@@ -310,15 +323,26 @@ class KaraokeGame(pyglet.window.Window):
         self.pitch_history.clear()
         self._last_history_add = 0.0
 
+    # Convert MIDI note number to a vertical position in the lane. 
+    # This maps the range of MIDI notes in the song to the vertical space of the lane, 
+    # allowing us to visually represent both target notes and microphone pitch history 
+    # in a way that shows how close the player's pitch is to the target. 
     def note_to_y_in_lane(self, midi_note: float, lane_bottom: float, lane_top: float) -> float:
         span = max(1, self.high_note - self.low_note)
         return lane_bottom + (midi_note - self.low_note) / span * (lane_top - lane_bottom)
 
+    # Convert a note time to an x position on the screen, based on the current song time.
+    # This allows us to scroll the target notes and microphone history from right to left as time
+    # progresses, creating a "lane" effect where notes approach a hit line and the player tries 
+    # to match them at the right moment.
     def time_to_x(self, note_time: float, current_time: float) -> float:
         hit_x = 260
         pixels_per_second = 150
         return hit_x + (note_time - current_time) * pixels_per_second
 
+    # Draw the background of a lane, including horizontal lines for each MIDI note. 
+    # This is called for both the target lane and the microphone lane, with different vertical positions. 
+    # The horizontal lines help the player visually gauge how close their pitch is to the target notes.
     def draw_lane_background(self, bottom: int, top: int) -> None:
         lane_left = 80
         lane_right = self.width - 30
@@ -330,6 +354,10 @@ class KaraokeGame(pyglet.window.Window):
             color = (52, 54, 66) if note % 12 not in (0, 5) else (75, 78, 95)
             shapes.Line(lane_left, y, lane_right, y, width=1, color=color).draw()
 
+    # Draw the target notes as blue rectangles in the upper lane. 
+    # The width of the rectangle represents the duration of the note, and the vertical position 
+    # represents the MIDI note number. If the current time is within the note's duration, 
+    # it is drawn in a brighter color to indicate that it is the active target.
     def draw_target_notes(self, t: float) -> None:
         bottom, top = 330, 540
         lane_left = 80
@@ -350,6 +378,8 @@ class KaraokeGame(pyglet.window.Window):
             rect.opacity = 220
             rect.draw()
 
+    # Yellow microphone lane was added iteratively during debugging
+    # to visually compare detected pitch against MIDI targets.
     def draw_mic_history(self, t: float) -> None:
         bottom, top = 100, 300
         lane_left = 80
@@ -382,10 +412,16 @@ class KaraokeGame(pyglet.window.Window):
             rect.opacity = 215
             rect.draw()
 
+    # Draw the hit line where the player is supposed to match the target notes. 
+    # This is a vertical line that serves as a visual reference for timing, 
+    # showing players where they should aim to have their pitch when singing the target notes.
     def draw_hit_line(self) -> None:
         hit_x = 260
         shapes.Line(hit_x, 92, hit_x, 548, width=2, color=(255, 255, 255)).draw()
 
+    # Draw the entire game screen, including lane backgrounds, target notes, microphone history, hit line, and labels. 
+    # This is called every frame to update the visuals based on the current game state and player input. 
+    # It also updates the text of the labels to show the current target note, score, combo
     def on_draw(self):
         self.clear()
         t = self.song_time()
@@ -421,14 +457,16 @@ class KaraokeGame(pyglet.window.Window):
             self.info_label.text = "Press SPACE to start. Top blue = target; bottom yellow = mic bars. R restarts. ESC quits."
         self.info_label.draw()
 
-
+# Handle key presses for starting/pausing the game, restarting, and quitting. SPACE toggles between start and pause, R restarts the game, and ESC quits.
 def list_input_devices() -> None:
     print("Available input devices:\n")
     for i, dev in enumerate(sd.query_devices()):
         if dev["max_input_channels"] > 0:
             print(f"{i}: {dev['name']}")
 
-
+# The main entry point of the program. Parses command line arguments for MIDI file, audio device, and other settings. 
+# Initializes the pitch detector and game window, and starts the Pyglet application loop. 
+# Also handles listing audio devices if requested.
 def main() -> None:
     parser = argparse.ArgumentParser(description="Karaoke game with target and microphone lanes.")
     parser.add_argument("midi", help="Path to MIDI file")
@@ -450,6 +488,8 @@ def main() -> None:
     finally:
         detector.stop()
 
-
+# AI tools were used during development for debugging support,
+# structure suggestions, and understanding DSP-related concepts.
+# The implementation and parameter tuning were iteratively modified during testing.
 if __name__ == "__main__":
     main()
