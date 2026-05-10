@@ -28,16 +28,6 @@ python karaoke.py read_midi/berge.mid
 - Pitch is compared to the target using cents (log scale)
 - Score increases when the pitch is close
 
-## AI Assistance
-
-AI tools were used during development for:
-- structure suggestions
-- debugging support
-- explanations of signal-processing concepts
-- help understanding autocorrelation-based pitch detection
-
-The implementation was manually modified, tested, and tuned during development.
-
 
 # Whistle Input
 
@@ -73,11 +63,3 @@ Noise is reduced using:
 - RMS threshold
 - peak-to-noise filtering
 - cooldown between detections
-
-## AI Assistance
-AI tools were used during development for:
-- debugging support
-- explanations of FFT-based pitch detection
-- discussing approaches for chirp detection and noise filtering
-
-The implementation, parameter tuning, and interaction behavior were modified and tested iteratively during development.
